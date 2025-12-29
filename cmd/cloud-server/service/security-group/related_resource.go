@@ -218,8 +218,8 @@ func (svc *securityGroupSvc) queryRelatedResourceCountFromCloud(kt *kit.Kit,
 	for _, group := range securityGroups {
 		statistic, ok := resultMap[group.ID]
 		if !ok {
-			logs.Errorf("security group %s statistic not found, rid: %s", group.ID, kt.Rid)
-			return nil, fmt.Errorf("security group %s statistic not found", group.ID)
+			logs.Warnf("security group %s statistic not found, rid: %s", group.ID, kt.Rid)
+			continue
 		}
 		result.Details = append(result.Details, statistic)
 	}
