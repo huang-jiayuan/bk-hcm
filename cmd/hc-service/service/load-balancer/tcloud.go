@@ -527,6 +527,7 @@ func buildCreateListenerOption(req *protolb.ListenerWithRuleCreateReq, lbInfo co
 		SniSwitch:         req.SniSwitch,
 		SessionType:       cvt.ValToPtr(req.SessionType),
 		Certificate:       req.Certificate,
+		EndPort:           req.EndPort,
 	}
 	if req.Protocol.IsLayer4Protocol() {
 		lblOpt.HealthCheck = &corelb.TCloudHealthCheckInfo{}
@@ -595,6 +596,7 @@ func (svc *clbSvc) insertListenerWithRule(kt *kit.Kit, req *protolb.ListenerWith
 				SniSwitch:          req.SniSwitch,
 				Certificate:        req.Certificate,
 				Region:             lbInfo.Region,
+				EndPort:            cvt.ValToPtr(int64(req.EndPort)),
 			},
 		},
 	}
@@ -1062,12 +1064,12 @@ func (svc *clbSvc) BatchDeleteTCloudLoadBalancer(cts *rest.Contexts) (any, error
 
 // InquiryPriceTCloudLB inquiry price tcloud clb.
 func (svc *clbSvc) InquiryPriceTCloudLB(cts *rest.Contexts) (any, error) {
-	req := new(protolb.TCloudLoadBalancerCreateReq)
+	req := new(protolb.TCloudLoadBalancerInquiryReq)
 	if err := cts.DecodeInto(req); err != nil {
 		return nil, errf.NewFromErr(errf.DecodeRequestFailed, err)
 	}
 
-	if err := req.Validate(false); err != nil {
+	if err := req.Validate(); err != nil {
 		return nil, errf.NewFromErr(errf.InvalidParameter, err)
 	}
 
@@ -1081,7 +1083,6 @@ func (svc *clbSvc) InquiryPriceTCloudLB(cts *rest.Contexts) (any, error) {
 	createOpt := &typelb.TCloudCreateClbOption{
 		Region:           req.Region,
 		LoadBalancerType: req.LoadBalancerType,
-		LoadBalancerName: req.Name,
 		VpcID:            req.CloudVpcID,
 		SubnetID:         req.CloudSubnetID,
 		Vip:              req.Vip,

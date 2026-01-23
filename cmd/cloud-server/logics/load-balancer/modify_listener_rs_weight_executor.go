@@ -26,7 +26,7 @@ import (
 
 	actionlb "hcm/cmd/task-server/logics/action/load-balancer"
 	actionflow "hcm/cmd/task-server/logics/flow"
-	coretask "hcm/pkg/api/core/task"
+	cslb "hcm/pkg/api/cloud-server/load-balancer"
 	dataproto "hcm/pkg/api/data-service/cloud"
 	"hcm/pkg/api/data-service/task"
 	hclb "hcm/pkg/api/hc-service/load-balancer"
@@ -45,12 +45,11 @@ import (
 )
 
 func newBatchListenerModifyRsWeightExecutor(cli *dataservice.Client, taskCli *taskserver.Client,
-	vendor enumor.Vendor, bkBizID int64, accountID string, regionIDs []string,
-	operationType OperationType) *BatchListenerModifyRsWeightExecutor {
+	vendor enumor.Vendor, bkBizID int64, accountID string, regionIDs []string) *BatchListenerModifyRsWeightExecutor {
 
 	return &BatchListenerModifyRsWeightExecutor{
-		taskType:            enumor.ListenerModifyRsWeightTaskType,
-		operationType:       enumor.TaskOperation(operationType),
+		taskType:            enumor.ModifyWeightTaskType,
+		operationType:       enumor.TaskTargetGroupModifyWeight,
 		taskCli:             taskCli,
 		basePreviewExecutor: newBasePreviewExecutor(cli, vendor, bkBizID, accountID, regionIDs),
 	}
@@ -65,7 +64,8 @@ type BatchListenerModifyRsWeightExecutor struct {
 	taskCli       *taskserver.Client
 	params        *dataproto.ListListenerWithTargetsReq
 	details       []*dataproto.ListBatchListenerResult
-	taskDetails   []*batchListenerModifyRsWeightTaskDetail
+	// 只会存放需要实际进行权重调整的数据
+	taskDetails []*batchListenerModifyRsWeightTaskDetail
 }
 
 // 用于记录 detail - 异步任务flow&task - 任务管理 之间的关系
@@ -73,6 +73,7 @@ type batchListenerModifyRsWeightTaskDetail struct {
 	taskDetailID string
 	flowID       string
 	actionID     string
+	*cslb.TgModifyWeightTaskDetailParam
 	*dataproto.ListBatchListenerResult
 }
 
@@ -96,13 +97,13 @@ func (c *BatchListenerModifyRsWeightExecutor) Execute(kt *kit.Kit, source enumor
 	c.filter()
 
 	// 获取符合条件的监听器及RS列表
-	LblRsList, err := c.getNewListenerRsList(kt)
+	LblRsList, needUpdate, err := c.getNewListenerRsList(kt)
 	if err != nil {
 		return "", err
 	}
 
 	// 没查到符合的监听器及RS，直接返回
-	if len(LblRsList) == 0 {
+	if !needUpdate {
 		logs.Infof("list batch listener by rsip is empty, lblReq: %+v, rid: %s", cvt.PtrToVal(c.params), kt.Rid)
 		return enumor.NoMatchTaskManageResult, nil
 	}
@@ -119,13 +120,14 @@ func (c *BatchListenerModifyRsWeightExecutor) Execute(kt *kit.Kit, source enumor
 }
 
 func (c *BatchListenerModifyRsWeightExecutor) getNewListenerRsList(kt *kit.Kit) (
-	[]*dataproto.ListBatchListenerResult, error) {
+	[]*dataproto.ListBatchListenerResult, bool, error) {
 
+	needUpdate := false
 	// 获取符合条件的监听器列表
 	lblResp, err := c.dataServiceCli.Global.LoadBalancer.ListLoadBalancerListenerWithTargets(kt, c.params)
 	if err != nil {
 		logs.Errorf("list batch listener by rsip failed, lblReq: %+v, err: %v, rid: %s", c.params, err, kt.Rid)
-		return nil, err
+		return nil, false, err
 	}
 
 	// 检查RS的最新权重是否已更新
@@ -146,15 +148,16 @@ func (c *BatchListenerModifyRsWeightExecutor) getNewListenerRsList(kt *kit.Kit) 
 		}
 
 		for _, rsItem := range item.RsList {
+			tmpLblRs.RsList = append(tmpLblRs.RsList, rsItem)
 			if cvt.PtrToVal(rsItem.Weight) != cvt.PtrToVal(c.params.NewRsWeight) {
-				tmpLblRs.RsList = append(tmpLblRs.RsList, rsItem)
+				needUpdate = true
 			}
 		}
 		if len(tmpLblRs.RsList) > 0 {
 			newLblRsList = append(newLblRsList, tmpLblRs)
 		}
 	}
-	return newLblRsList, nil
+	return newLblRsList, needUpdate, nil
 }
 
 // Run 执行器执行入口
@@ -286,9 +289,6 @@ func (c *BatchListenerModifyRsWeightExecutor) createTaskManagement(
 				Resource:   enumor.TaskManagementResClb,
 				State:      enumor.TaskManagementRunning, // 默认:执行中
 				Operations: []enumor.TaskOperation{c.operationType},
-				Extension: &coretask.ManagementExt{
-					LblTargetsReq: c.params,
-				},
 			},
 		},
 	}
@@ -308,41 +308,79 @@ func (c *BatchListenerModifyRsWeightExecutor) createTaskManagement(
 
 // createTaskDetails 创建任务详情列表
 func (c *BatchListenerModifyRsWeightExecutor) createTaskDetails(kt *kit.Kit, taskID string) error {
-	taskDetailsCreateReq := &task.CreateDetailReq{}
+	items := make([]task.CreateDetailField, 0)
+	sameItems := make([]task.CreateDetailField, 0)
 	for _, detail := range c.details {
-		taskDetailsCreateReq.Items = append(taskDetailsCreateReq.Items, task.CreateDetailField{
-			BkBizID:          c.bkBizID,
-			TaskManagementID: taskID,
-			Operation:        c.operationType,
-			State:            enumor.TaskDetailInit,
-			Param:            detail,
-		})
+		for _, rs := range detail.RsList {
+			param := cslb.TgModifyWeightTaskDetailParam{
+				TGRelatedInfo: cslb.TGRelatedInfo{
+					CloudLBID:    detail.CloudClbID,
+					ClbVipDomain: detail.ClbVipDomain,
+					Protocol:     detail.Protocol,
+					Port:         detail.Port,
+					Domain:       rs.Domain,
+					URL:          rs.Url,
+				},
+				TargetBaseReq: &dataproto.TargetBaseReq{
+					ID:                rs.ID,
+					IP:                rs.IP,
+					InstType:          rs.InstType,
+					Port:              rs.Port,
+					Weight:            rs.Weight,
+					AccountID:         rs.AccountID,
+					TargetGroupID:     rs.TargetGroupID,
+					CloudInstID:       rs.CloudInstID,
+					InstName:          rs.InstName,
+					TargetGroupRegion: rs.TargetGroupRegion,
+					PrivateIPAddress:  rs.PrivateIPAddress,
+					PublicIPAddress:   rs.PublicIPAddress,
+					CloudVpcIDs:       rs.CloudVpcIDs,
+					Zone:              rs.Zone,
+					NewWeight:         detail.NewRsWeight,
+				},
+			}
+			item := task.CreateDetailField{
+				BkBizID:          c.bkBizID,
+				TaskManagementID: taskID,
+				Operation:        c.operationType,
+				State:            enumor.TaskDetailInit,
+				Param:            param,
+			}
+			if cvt.PtrToVal(rs.Weight) != cvt.PtrToVal(detail.NewRsWeight) {
+				taskDetail := &batchListenerModifyRsWeightTaskDetail{
+					TgModifyWeightTaskDetailParam: &param,
+				}
+				c.taskDetails = append(c.taskDetails, taskDetail)
+				items = append(items, item)
+				continue
+			}
+			item.State = enumor.TaskDetailSuccess
+			sameItems = append(sameItems, item)
+		}
 	}
-
+	items = append(items, sameItems...)
+	taskDetailsCreateReq := &task.CreateDetailReq{Items: items}
 	result, err := c.dataServiceCli.Global.TaskDetail.Create(kt, taskDetailsCreateReq)
 	if err != nil {
 		logs.Errorf("create dataservice task detail failed, err: %v, taskID: %s, rid: %s", err, taskID, kt.Rid)
 		return err
 	}
 
-	if len(result.IDs) != len(c.details) {
+	if len(result.IDs) != len(items) {
 		return fmt.Errorf("create task details failed, operation: %s, expect created[%d] task details, but got [%d]",
-			c.operationType, len(c.details), len(result.IDs))
+			c.operationType, len(items), len(result.IDs))
 	}
 
-	for i := range result.IDs {
-		taskDetail := &batchListenerModifyRsWeightTaskDetail{
-			taskDetailID:            result.IDs[i],
-			ListBatchListenerResult: c.details[i],
-		}
-		c.taskDetails = append(c.taskDetails, taskDetail)
+	for i := range c.taskDetails {
+		c.taskDetails[i].taskDetailID = result.IDs[i]
+		c.taskDetails[i].ListBatchListenerResult = c.details[i]
 	}
 
 	return nil
 }
 
 func (c *BatchListenerModifyRsWeightExecutor) buildFlow(kt *kit.Kit, lbID string,
-	details []*batchListenerModifyRsWeightTaskDetail) (string, error) {
+	tgIDDetails []*batchListenerModifyRsWeightTaskDetail) (string, error) {
 
 	// 预检测
 	lockRel, err := checkResFlowRel(kt, c.dataServiceCli, lbID, enumor.LoadBalancerCloudResType)
@@ -352,12 +390,11 @@ func (c *BatchListenerModifyRsWeightExecutor) buildFlow(kt *kit.Kit, lbID string
 		return "", err
 	}
 
-	flowTasks, err := c.buildFlowTask(lbID, details)
+	flowTasks, err := c.buildFlowTask(lbID, tgIDDetails)
 	if err != nil {
 		logs.Errorf("build flow task failed, err: %v, lbID: %s, rid: %s", err, lbID, kt.Rid)
 		return "", err
 	}
-
 	flowID, err := c.createFlowTask(kt, lbID, flowTasks)
 	if err != nil {
 		logs.Errorf("create flow task failed, err: %v, lbID: %s, rid: %s", err, lbID, kt.Rid)
@@ -365,13 +402,13 @@ func (c *BatchListenerModifyRsWeightExecutor) buildFlow(kt *kit.Kit, lbID string
 	}
 
 	err = lockResFlowStatus(kt, c.dataServiceCli, c.taskCli, lbID,
-		enumor.LoadBalancerCloudResType, flowID, enumor.ListenerModifyRsWeightTaskType)
+		enumor.LoadBalancerCloudResType, flowID, enumor.ModifyWeightTaskType)
 	if err != nil {
 		logs.Errorf("lock resource flow status failed, err: %v, lbID: %s, rid: %s", err, lbID, kt.Rid)
 		return "", err
 	}
 
-	for _, detail := range details {
+	for _, detail := range tgIDDetails {
 		detail.flowID = flowID
 	}
 
@@ -381,6 +418,7 @@ func (c *BatchListenerModifyRsWeightExecutor) buildFlow(kt *kit.Kit, lbID string
 func (c *BatchListenerModifyRsWeightExecutor) buildFlowTask(lbID string,
 	details []*batchListenerModifyRsWeightTaskDetail) ([]ts.CustomFlowTask, error) {
 
+	// NOTE: 目前只支持腾讯云（支持跨目标组批量操作RS权重）
 	switch c.vendor {
 	case enumor.TCloud:
 		return c.buildTCloudFlowTask(lbID, details)
@@ -394,17 +432,16 @@ func (c *BatchListenerModifyRsWeightExecutor) buildTCloudFlowTask(lbID string,
 
 	result := make([]ts.CustomFlowTask, 0)
 	actionIDGenerator := counter.NewNumberCounterWithPrev(1, 10)
-	for _, taskDetails := range slice.Split(details, constant.BatchTaskMaxLimit) {
+	for _, partDetails := range slice.Split(details, constant.BatchTaskMaxLimit) {
 		cur, prev := actionIDGenerator()
-
-		lblRsList := make([]*hclb.TCloudBatchModifyRsWeightReq, 0, len(taskDetails))
-		managementDetailIDs := make([]string, 0, len(taskDetails))
-		for _, detail := range taskDetails {
+		lblRsList := make([]*hclb.TCloudBatchModifyRsWeightReq, 0, len(partDetails))
+		managementDetailIDs := make([]string, 0, len(partDetails))
+		for _, detail := range partDetails {
 			rsWeightReq := &hclb.TCloudBatchModifyRsWeightReq{
 				AccountID:           c.accountID,
 				Region:              detail.Region,
 				Vendor:              c.vendor,
-				LoadBalancerCloudId: detail.CloudClbID,
+				LoadBalancerCloudId: detail.CloudLBID,
 				Details:             make([]*dataproto.ListBatchListenerResult, 0),
 				NewRsWeight:         c.params.NewRsWeight,
 			}
@@ -429,7 +466,7 @@ func (c *BatchListenerModifyRsWeightExecutor) buildTCloudFlowTask(lbID string,
 		}
 		result = append(result, tmpTask)
 
-		for _, detail := range taskDetails {
+		for _, detail := range partDetails {
 			detail.actionID = cur
 		}
 	}
@@ -441,7 +478,7 @@ func (c *BatchListenerModifyRsWeightExecutor) createFlowTask(kt *kit.Kit, lbID s
 	flowTasks []ts.CustomFlowTask) (string, error) {
 
 	addReq := &ts.AddCustomFlowReq{
-		Name: enumor.FlowBatchTaskListenerModifyRsWeight,
+		Name: enumor.FlowTargetGroupModifyWeight,
 		ShareData: tableasync.NewShareData(map[string]string{
 			"lb_id": lbID,
 		}),
@@ -458,10 +495,10 @@ func (c *BatchListenerModifyRsWeightExecutor) createFlowTask(kt *kit.Kit, lbID s
 	flowID := result.ID
 	// 从Flow，负责监听主Flow的状态
 	flowWatchReq := &ts.AddTemplateFlowReq{
-		Name: enumor.FlowLoadBalancerOperateWatch,
+		Name: enumor.FlowSlaveOperateWatch,
 		Tasks: []ts.TemplateFlowTask{{
 			ActionID: "1",
-			Params: &actionflow.LoadBalancerOperateWatchOption{
+			Params: &actionflow.FlowSlaveOperateWatchOption{
 				FlowID:     flowID,
 				ResID:      lbID,
 				ResType:    enumor.LoadBalancerCloudResType,

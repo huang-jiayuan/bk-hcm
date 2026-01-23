@@ -52,6 +52,7 @@ import (
 	"hcm/cmd/cloud-server/service/image"
 	instancetype "hcm/cmd/cloud-server/service/instance-type"
 	loadbalancer "hcm/cmd/cloud-server/service/load-balancer"
+	"hcm/cmd/cloud-server/service/monitoring"
 	networkinterface "hcm/cmd/cloud-server/service/network-interface"
 	"hcm/cmd/cloud-server/service/recycle"
 	"hcm/cmd/cloud-server/service/region"
@@ -231,6 +232,7 @@ func (s *Service) ListenAndServeRest() error {
 	root := http.NewServeMux()
 	root.HandleFunc("/", s.apiSet(cc.CloudServer().BkHcmUrl).ServeHTTP)
 	root.HandleFunc("/healthz", s.Healthz)
+	root.HandleFunc("/alivez", s.Alivez)
 	handler.SetCommonHandler(root)
 
 	network := cc.CloudServer().Network
@@ -315,6 +317,7 @@ func (s *Service) apiSet(bkHcmUrl string) *restful.Container {
 	region.InitRegionService(c)
 	eip.InitEipService(c)
 	instancetype.InitInstanceTypeService(c)
+	monitoring.InitMonitoringService(c)
 	networkinterface.InitNetworkInterfaceService(c)
 	subaccount.InitService(c)
 
@@ -360,5 +363,19 @@ func (s *Service) Healthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rest.WriteResp(w, rest.NewBaseResp(errf.OK, "healthy"))
+	return
+}
+
+// Alivez simply returns OK to indicate the service is alive.
+func (s *Service) Alivez(w http.ResponseWriter, r *http.Request) {
+	if shutdown.IsShuttingDown() {
+		logs.Errorf("service %s alivez check failed, current service is shutting down", cc.ServiceName())
+		w.WriteHeader(http.StatusServiceUnavailable)
+		rest.WriteResp(w, rest.NewBaseResp(errf.UnHealthy,
+			fmt.Sprintf("service %s is shutting down", cc.ServiceName())))
+		return
+	}
+
+	rest.WriteResp(w, rest.NewBaseResp(errf.OK, "alive"))
 	return
 }
