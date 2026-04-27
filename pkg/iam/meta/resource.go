@@ -116,6 +116,9 @@ const (
 	// CosBucket cos桶
 	CosBucket ResourceType = "cos_bucket"
 
-	// globalConfig 全局配置
+	// GlobalConfig 全局配置
 	GlobalConfig ResourceType = "global_config"
+
+	// PermissionPolicyLibrary 权限策略库
+	PermissionPolicyLibrary ResourceType = "permission_policy_library"
 )

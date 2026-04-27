@@ -21,6 +21,17 @@ export type ModelPropertyType =
   | 'json'
   | 'cloud-area';
 
+export type AppearanceType =
+  | 'status'
+  | 'link'
+  | 'wxwork-link'
+  | 'tag'
+  | 'cvm-status'
+  | 'clb-status'
+  | 'business-assign-tag'
+  | 'dynamic-status'
+  | 'link-button';
+
 export type ModelPropertyMeta = {
   display?: PropertyDisplayConfig;
   search?: PropertySearchConfig;
@@ -43,6 +54,7 @@ export type ModelProperty = {
 };
 
 export type PropertyColumnConfig = {
+  label?: () => VNode;
   sort?: boolean;
   align?: 'left' | 'center' | 'right';
   cell?: PrimaryTableCol['cell'];
@@ -78,7 +90,8 @@ export type PropertySearchConfig = {
 };
 
 export type PropertyDisplayConfig = {
-  appearance?: string;
+  on?: 'cell' | 'info' | 'search';
+  appearance?: AppearanceType;
   appearanceProps?: Record<string, any>;
   format?: (value: any) => any;
   render?: (value: any) => VNode | string;

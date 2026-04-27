@@ -79,6 +79,27 @@ func decodeCommonReqAndValidate(cts *rest.Contexts) (*proto.CreateCommonReq, err
 	return req, nil
 }
 
+func decodeSysCommonReqAndValidate(cts *rest.Contexts) (*proto.SysCreateCommonReq, error) {
+	bytes, err := cts.RequestBody()
+	if err != nil {
+		logs.Errorf("get request body failed, err: %v, rid: %s", err, cts.Kit.Rid)
+		return nil, err
+	}
+
+	req := new(proto.SysCreateCommonReq)
+	if err = json.Unmarshal(bytes, req); err != nil {
+		logs.Errorf("unmarshal sys create common req failed, err: %v, rid: %s", err, cts.Kit.Rid)
+		return nil, err
+	}
+
+	if err = req.Validate(); err != nil {
+		logs.Errorf("sys create common request validate failed, err: %v, rid: %s", err, cts.Kit.Rid)
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // create 创建申请单的通用逻辑
 func (a *applicationSvc) create(cts *rest.Contexts, req *proto.CreateCommonReq,
 	handler handlers.ApplicationHandler) (interface{}, error) {
@@ -109,7 +130,9 @@ func (a *applicationSvc) create(cts *rest.Contexts, req *proto.CreateCommonReq,
 
 // createApplicationRequest ...
 func (a *applicationSvc) createApplication(cts *rest.Contexts, req *proto.CreateCommonReq,
-	handler handlers.ApplicationHandler, sn string, applicationType enumor.ApplicationType) (*core.CreateResult, error) {
+	handler handlers.ApplicationHandler, sn string, applicationType enumor.ApplicationType) (*core.CreateResult,
+	error) {
+
 	// 调用DB创建单据
 	content, err := json.MarshalToString(handler.GenerateApplicationContent())
 	if err != nil {
@@ -120,12 +143,20 @@ func (a *applicationSvc) createApplication(cts *rest.Contexts, req *proto.Create
 	}
 
 	// 主机、硬盘、VPC、负载均衡需要记录业务ID
+	var needBkBizIDsOps = map[enumor.ApplicationOperation]struct{}{
+		enumor.OpCreateCvm:          {},
+		enumor.OpCreateDisk:         {},
+		enumor.OpCreateVpc:          {},
+		enumor.OpCreateLoadBalancer: {},
+		enumor.OpAddAccount:         {},
+	}
+
 	var bkBizIDs = make([]int64, 0)
-	if applicationType == enumor.CreateCvm || applicationType == enumor.CreateDisk ||
-		applicationType == enumor.CreateVpc || applicationType == enumor.CreateLoadBalancer ||
-		applicationType == enumor.AddAccount {
+	if _, ok := needBkBizIDsOps[handler.GetOperation()]; ok {
 		bkBizIDs = handler.GetBkBizIDs()
 	}
+	operation := handler.GetOperation()
+
 	return a.client.DataService().Global.Application.CreateApplication(
 		cts.Kit.Ctx,
 		cts.Kit.Header(),
@@ -133,6 +164,7 @@ func (a *applicationSvc) createApplication(cts *rest.Contexts, req *proto.Create
 			SN:             sn,
 			Source:         enumor.ApplicationSourceITSM,
 			Type:           applicationType,
+			Operation:      operation,
 			Status:         enumor.Pending,
 			BkBizIDs:       bkBizIDs,
 			Applicant:      cts.Kit.User,
@@ -167,7 +199,11 @@ func (a *applicationSvc) createItsmTicket(cts *rest.Contexts, handler handlers.A
 	}
 
 	// 获取ITSM单据涉及到的各个节点审批人
-	approvers := handler.GetItsmApprover(managers)
+	approvers, err := handler.GetItsmApprover(cts.Kit, managers)
+	if err != nil {
+		logs.Errorf("get itsm approver failed, err: %v, rid: %s", err, cts.Kit.Rid)
+		return "", fmt.Errorf("get itsm approver failed, err: %v", err)
+	}
 
 	sn, err := a.itsmCli.CreateTicket(
 		cts.Kit,
@@ -425,6 +461,38 @@ func (a *applicationSvc) CreateForCreateLB(cts *rest.Contexts) (interface{}, err
 	}
 
 	return nil, nil
+}
+
+// SysCreateForCreateLB creates a CLB application on behalf of a specified applicant for system-level callers.
+func (a *applicationSvc) SysCreateForCreateLB(cts *rest.Contexts) (interface{}, error) {
+	vendor := enumor.Vendor(cts.Request.PathParameter("vendor"))
+	if err := vendor.Validate(); err != nil {
+		return nil, errf.NewFromErr(errf.InvalidParameter, err)
+	}
+
+	commReq, err := decodeSysCommonReqAndValidate(cts)
+	if err != nil {
+		return nil, errf.NewFromErr(errf.InvalidParameter, err)
+	}
+
+	if err := a.checkApplyResPermission(cts, meta.LoadBalancer); err != nil {
+		return nil, err
+	}
+
+	cts.Kit.User = commReq.Applicant
+	opt := a.getHandlerOption(cts)
+
+	switch vendor {
+	case enumor.TCloud:
+		req, err := parseReqFromRequestBody[hclb.TCloudLoadBalancerCreateReq](cts)
+		if err != nil {
+			return nil, err
+		}
+		handler := lbtcloud.NewApplicationOfCreateTCloudLB(opt, req)
+		return a.create(cts, &commReq.CreateCommonReq, handler)
+	}
+
+	return nil, errf.Newf(errf.InvalidParameter, "unsupported vendor: %s", vendor)
 }
 
 // CreateForCreateMainAccount ...
